@@ -17,6 +17,7 @@ import boto3
 from botocore.exceptions import ClientError
 import httpx    
 from pydantic import BaseModel 
+import asyncio # Make sure asyncio is imported
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO,
@@ -73,21 +74,24 @@ class ProcessRequest(BaseModel):
 def extract_text_with_pypdf(file_path):
     """Extract text using PyPDF as a fallback method"""
     logger.info(f"Attempting text extraction with PyPDF for {file_path}")
+    text = ""
     try:
-        reader = pypdf.PdfReader(file_path)
-        text = ""
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n\n" # Add separator between pages
+        # Use 'with' statement to ensure the file is closed properly
+        with open(file_path, 'rb') as f: # Open in binary mode for pypdf
+            reader = pypdf.PdfReader(f)
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n\n" # Add separator between pages
         logger.info(f"PyPDF extracted approx {len(text)} characters.")
         return text
     except Exception as e:
         logger.error(f"PyPDF extraction error: {str(e)}")
+        logger.error(traceback.format_exc()) # Log full traceback for debugging
         return ""
 
 async def notify_nextjs(document_id: str, success: bool, error_message: Optional[str] = None):
-    """Sends completion status back to the Next.js API route."""
+    """Sends completion status back to the Next.js API route with retries."""
     if not NEXTJS_CALLBACK_URL or not PYTHON_SERVICE_SECRET:
         logger.error("Callback URL or Secret not configured. Cannot notify Next.js.")
         return
@@ -101,21 +105,63 @@ async def notify_nextjs(document_id: str, success: bool, error_message: Optional
         "Content-Type": "application/json",
         "X-Processing-Secret": PYTHON_SERVICE_SECRET # Authentication header
     }
-    logger.info(f"Attempting to notify Next.js at {NEXTJS_CALLBACK_URL} for doc {document_id}, success={success}")
 
-    async with httpx.AsyncClient(timeout=30.0) as client: # Add a timeout
-        try:
-            response = await client.post(NEXTJS_CALLBACK_URL, json=payload, headers=headers)
-            response.raise_for_status() # Check for 4xx/5xx errors
-            logger.info(f"Successfully notified Next.js for document {document_id}. Status: {success}. Response: {response.status_code}")
-        except httpx.RequestError as e:
-            logger.error(f"HTTP Request error notifying Next.js for document {document_id}: {e}")
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP Status error notifying Next.js for document {document_id}: {e.response.status_code} - {e.response.text}")
-        except Exception as e:
-            logger.error(f"Unexpected error notifying Next.js for document {document_id}: {e}")
-            logger.error(traceback.format_exc())
+    # --- Retry Logic Parameters ---
+    max_retries = 3
+    base_delay = 2  # seconds
+    connect_timeout = 15.0 # Increased connect timeout
+    read_timeout = 30.0  # Standard read timeout
+        # Provide all four timeout values: connect, read, write, pool
+    timeout_config = httpx.Timeout(connect=connect_timeout, read=read_timeout, write=read_timeout, pool=read_timeout)
+    # --- End Retry Logic Parameters ---
 
+
+    for attempt in range(max_retries):
+        logger.info(f"Attempting to notify Next.js (Attempt {attempt + 1}/{max_retries}) at {NEXTJS_CALLBACK_URL} for doc {document_id}, success={success}")
+        # Use a new client for each attempt to ensure clean state for timeouts
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
+            try:
+                response = await client.post(NEXTJS_CALLBACK_URL, json=payload, headers=headers)
+                response.raise_for_status() # Check for 4xx/5xx errors
+                logger.info(f"Successfully notified Next.js for document {document_id} after attempt {attempt + 1}. Status: {success}. Response: {response.status_code}")
+                return # Exit loop on success
+
+            except httpx.ConnectTimeout as e:
+                logger.warning(f"ConnectTimeout on attempt {attempt + 1} for doc {document_id}: {e}. Retrying in {base_delay * (2**attempt)}s...")
+                if attempt == max_retries - 1: # Last attempt failed
+                    logger.error(f"ConnectTimeout failed after {max_retries} attempts for doc {document_id}.")
+                    logger.error(traceback.format_exc())
+                    return # Exit after final attempt
+                await asyncio.sleep(base_delay * (2**attempt)) # Exponential backoff
+
+            except httpx.ReadTimeout as e: # Handle potential read timeouts too
+                logger.warning(f"ReadTimeout on attempt {attempt + 1} for doc {document_id}: {e}. Retrying in {base_delay * (2**attempt)}s...")
+                if attempt == max_retries - 1: # Last attempt failed
+                    logger.error(f"ReadTimeout failed after {max_retries} attempts for doc {document_id}.")
+                    logger.error(traceback.format_exc())
+                    return # Exit after final attempt
+                await asyncio.sleep(base_delay * (2**attempt)) # Exponential backoff
+
+            except httpx.RequestError as e: # Other non-timeout request errors (likely not retryable)
+                logger.error(f"HTTP Request error (non-timeout) notifying Next.js for document {document_id}: {e}")
+                logger.error(traceback.format_exc())
+                return # Exit loop on non-retryable request errors
+
+            except httpx.HTTPStatusError as e: # Handle 4xx/5xx errors
+                # Retry on 5xx errors (server-side issues)
+                if 500 <= e.response.status_code < 600 and attempt < max_retries - 1:
+                     logger.warning(f"HTTP Status error {e.response.status_code} on attempt {attempt + 1} for doc {document_id}. Retrying in {base_delay * (2**attempt)}s...")
+                     await asyncio.sleep(base_delay * (2**attempt)) # Exponential backoff
+                     continue # Go to next attempt in the loop
+
+                # Log final 5xx failure or any 4xx error and exit
+                logger.error(f"HTTP Status error notifying Next.js for document {document_id} (final attempt or non-retryable): {e.response.status_code} - {e.response.text}")
+                return # Exit loop on non-retryable status errors (e.g., 4xx) or final 5xx failure
+
+            except Exception as e: # Catch-all for unexpected errors during the request
+                logger.error(f"Unexpected error notifying Next.js for document {document_id} during attempt {attempt + 1}: {e}")
+                logger.error(traceback.format_exc())
+                return # Exit loop on unexpected errors
 
 # --- API Endpoints ---
 @app.get("/health")

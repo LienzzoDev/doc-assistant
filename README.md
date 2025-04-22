@@ -80,9 +80,47 @@ El servidor estará disponible en `http://localhost:8000`
 - `GET /health`: Verificar el estado del servicio
 - `POST /process`: Procesar documentos
 
-## Desactivar el Entorno Virtual
+## Ejecutar con Docker
 
-Cuando hayas terminado de trabajar en el proyecto, puedes desactivar el entorno virtual:
+Si prefieres ejecutar la aplicación en un contenedor Docker:
+
+### Requisitos Previos
+
+- Docker Desktop instalado y en ejecución.
+
+### 1. Construir la Imagen Docker
+
+En la raíz del proyecto, donde se encuentra el `Dockerfile`:
+
+```bash
+docker build -t doc-assistant-app .
+```
+
+### 2. Ejecutar el Contenedor Docker
+
+```bash
+# Asegúrate de que tu archivo .env está en la raíz del proyecto
+docker run -d --name doc-assistant-container -p 8000:8000 --env-file .env doc-processor-app
+```
+
+- `-d`: Ejecuta el contenedor en segundo plano.
+- `--name doc-assistant-container`: Asigna un nombre al contenedor.
+- `-p 8000:8000`: Mapea el puerto 8000 del host al puerto 8000 del contenedor.
+- `--env-file .env`: Carga las variables de entorno desde el archivo `.env` local. **Importante:** Este archivo no se incluye en la imagen, se lee desde tu sistema al ejecutar el contenedor.
+- `doc-assistant-app`: El nombre de la imagen que construiste.
+
+La aplicación estará accesible en `http://localhost:8000`.
+
+### Comandos Docker Útiles
+
+- Ver contenedores en ejecución: `docker ps`
+- Ver logs del contenedor: `docker logs doc-assistant-container`
+- Detener el contenedor: `docker stop doc-assistant-container`
+- Eliminar el contenedor (después de detenerlo): `docker rm doc-assistant-container`
+
+## Desactivar el Entorno Virtual (si se usó localmente)
+
+Cuando hayas terminado de trabajar en el proyecto localmente (sin Docker), puedes desactivar el entorno virtual:
 
 ```bash
 deactivate
