@@ -18,8 +18,8 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install runtime dependencies for PDF processing
-RUN apt-get update && apt-get install -y \
+# Install runtime dependencies for PDF processing and curl
+RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     tesseract-ocr \
     tesseract-ocr-eng \
@@ -28,7 +28,8 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     ghostscript \
     pdftk \
-    && rm -rf /var/lib/apt/lists/*
+    curl \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Copy virtual environment from builder stage
 COPY --from=builder /opt/venv /opt/venv
@@ -38,7 +39,9 @@ ENV PATH="/opt/venv/bin:$PATH"
 COPY main.py .
 
 # Create non-root user for security
-RUN useradd -m appuser
+RUN useradd --create-home --shell /bin/bash appuser
+# Change ownership before switching user
+RUN chown -R appuser:appuser /app
 USER appuser
 
 # Set environment variables
