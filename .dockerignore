@@ -1,7 +1,40 @@
-venv/
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.git
+.Python
+*.so
+.tox
+.venv/
 .env
+.pytest_cache/
+.coverage
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Documentation
+README.md
+*.md
+
+# Temporary files
+*.tmp
+*.temp
+
+# Fly.io
+fly.toml

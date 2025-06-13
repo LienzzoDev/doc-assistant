@@ -18,16 +18,9 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install runtime dependencies for PDF processing
+# Install only curl for health check
 RUN apt-get update && apt-get install -y \
-    poppler-utils \
-    tesseract-ocr \
-    tesseract-ocr-eng \
-    libmagic1 \
-    libgl1 \
-    libglib2.0-0 \
-    ghostscript \
-    pdftk \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy virtual environment from builder stage
@@ -46,7 +39,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 # Add healthcheck
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
   CMD curl --fail http://localhost:8000/health || exit 1
 
 # Expose port
