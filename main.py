@@ -5,18 +5,23 @@ import tempfile
 import os
 import traceback
 import logging
+import asyncio
 from dotenv import load_dotenv
 from typing import Optional, Dict, Any, List
 import json
-from langchain_unstructured.document_loaders import UnstructuredLoader
-from langchain_openai import OpenAIEmbeddings
-import pypdf
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
 import boto3 
 from botocore.exceptions import ClientError
 import httpx    
 from pydantic import BaseModel 
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+from docling.datamodel.document import DoclingDocument
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pinecone import Pinecone
+import re
+from openai import OpenAI
+import base64
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO,
@@ -30,64 +35,334 @@ load_dotenv()
 app = FastAPI(title="Document Processor")
 
 try:
-    embeddings = OpenAIEmbeddings(
-        api_key=os.getenv("OPENAI_API_KEY"), model="text-embedding-3-small"
-    )
     s3_client = boto3.client(
         's3',
         region_name=os.getenv("AWS_S3_REGION"),
         aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
     )
+    
+    # Initialize Pinecone
+    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+    pinecone_index = pc.Index(os.getenv("PINECONE_INDEX_NAME"))
+    
+    # Initialize OpenAI client
+    openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    
     S3_BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME")
     NEXTJS_CALLBACK_URL = os.getenv("NEXTJS_CALLBACK_URL")
     PYTHON_SERVICE_SECRET = os.getenv("PYTHON_SERVICE_SECRET")
+    PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "__default__")
+
+    # Initialize Docling converter with OPTIMIZED table parsing options
+    pipeline_options = PdfPipelineOptions()
+    
+    # CRITICAL: Enable table structure detection
+    pipeline_options.do_table_structure = True
+    
+    # Table structure options - IMPROVED SETTINGS
+    pipeline_options.table_structure_options.do_cell_matching = True  # Enable this for better table parsing
+    pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE  # Best quality
+    
+    # OCR options for better text extraction
+    pipeline_options.do_ocr = False
+    pipeline_options.ocr_options.force_full_page_ocr = False  # Only OCR when needed
+    
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+        }
+    )
+
+    # IMPROVED text splitter with table-aware separators
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=2000,        # Larger chunks for complete tables
+        chunk_overlap=400,      # More overlap for context
+        separators=[
+            "\n\n\n\n",        # Multiple line breaks (section separators)
+            "\n\n\n",          # Between sections
+            "\n\n",            # Paragraph breaks
+            "\n## ",           # Headers
+            "\n### ",
+            "\n#### ",
+            "\n|",             # Table row endings
+            "|\n",             # Another table pattern
+            "\n- ",            # List items
+            "\n* ",
+            ". ",
+            ".\n",
+            " ",
+        ],
+        keep_separator=True,    # Keep separators for better context
+        length_function=len,
+    )
 
     # Validate essential environment variables
-    if not all([os.getenv("OPENAI_API_KEY"), os.getenv("AWS_ACCESS_KEY_ID"), os.getenv("AWS_SECRET_ACCESS_KEY"), S3_BUCKET_NAME, NEXTJS_CALLBACK_URL, PYTHON_SERVICE_SECRET]):
+    required_vars = [
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", 
+        "PINECONE_API_KEY", "PINECONE_INDEX_NAME",
+        S3_BUCKET_NAME, NEXTJS_CALLBACK_URL, PYTHON_SERVICE_SECRET
+    ]
+    if not all(os.getenv(var) for var in required_vars):
         logger.critical("CRITICAL: Missing one or more required environment variables!")
-        # You might want to exit here in a real deployment
-        # sys.exit("Missing environment variables")
 
 except Exception as e:
-    logger.critical(f"CRITICAL: Failed to initialize clients or load environment variables: {e}")
-    # sys.exit("Initialization failed")
+    logger.critical(f"CRITICAL: Failed to initialize clients: {e}")
 
 # --- CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # TODO: Restrict this in production to your Next.js app's URL
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["POST", "GET"], # Limit methods if needed
+    allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
-# --- Pydantic Model for Request Body ---
 class ProcessRequest(BaseModel):
     s3_key: str
     document_id: str
-    # Add other fields if Next.js sends them (e.g., original filename for metadata)
-    # filename: Optional[str] = None
 
-# --- Helper Functions ---
-def extract_text_with_pypdf(file_path):
-    """Extract text using PyPDF as a fallback method"""
-    logger.info(f"Attempting text extraction with PyPDF for {file_path}")
+def extract_tables_from_docling(document: DoclingDocument) -> List[Dict]:
+    """Extract tables with their context from Docling document"""
+    tables = []
+    
     try:
-        reader = pypdf.PdfReader(file_path)
-        text = ""
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n\n" # Add separator between pages
-        logger.info(f"PyPDF extracted approx {len(text)} characters.")
-        return text
+        # Get tables from document
+        for table in document.tables:
+            table_data = {
+                "content": table.export_to_markdown(doc=document),
+                "caption": getattr(table, 'caption', ''),
+                "bbox": getattr(table, 'bbox', None),
+                "page": getattr(table, 'page', None)
+            }
+            tables.append(table_data)
+            logger.info(f"Extracted table: {table_data['content'][:100]}...")
     except Exception as e:
-        logger.error(f"PyPDF extraction error: {str(e)}")
-        return ""
+        logger.warning(f"Error extracting tables: {e}")
+    
+    return tables
 
-async def notify_nextjs(document_id: str, success: bool, error_message: Optional[str] = None):
-    """Sends completion status back to the Next.js API route."""
+def create_smart_chunks(markdown_content: str, tables: List[Dict]) -> List[Dict]:
+    """Create intelligent chunks that preserve table structure"""
+    chunks = []
+    
+    # First, identify table positions in markdown
+    table_positions = []
+    for i, table in enumerate(tables):
+        table_content = table["content"]
+        start_pos = markdown_content.find(table_content)
+        if start_pos != -1:
+            table_positions.append({
+                "start": start_pos,
+                "end": start_pos + len(table_content),
+                "table_index": i,
+                "content": table_content,
+                "caption": table.get("caption", "")
+            })
+    
+    # Sort by position
+    table_positions.sort(key=lambda x: x["start"])
+    
+    current_pos = 0
+    chunk_index = 0
+    
+    for table_pos in table_positions:
+        # Add text before table as separate chunks
+        text_before = markdown_content[current_pos:table_pos["start"]].strip()
+        if text_before:
+            text_chunks = text_splitter.split_text(text_before)
+            for text_chunk in text_chunks:
+                if len(text_chunk.strip()) > 20:  # Minimum viable chunk
+                    chunks.append({
+                        "content": text_chunk,
+                        "type": "text",
+                        "chunk_index": chunk_index,
+                        "contains_table": False
+                    })
+                    chunk_index += 1
+        
+        # Add table as a complete chunk with context
+        table_chunk_content = table_pos["content"]
+        
+        # Add some context before and after the table
+        context_before_start = max(0, table_pos["start"] - 150)
+        context_after_end = min(len(markdown_content), table_pos["end"] + 150)
+        
+        context_before = markdown_content[context_before_start:table_pos["start"]].strip()
+        context_after = markdown_content[table_pos["end"]:context_after_end].strip()
+        
+        # Create enhanced table chunk
+        enhanced_table_content = ""
+        if context_before:
+            # Get last paragraph before table
+            context_lines = context_before.split('\n')
+            relevant_context = '\n'.join(context_lines[-3:]) if len(context_lines) > 3 else context_before
+            enhanced_table_content += f"{relevant_context}\n\n"
+        
+        enhanced_table_content += table_chunk_content
+        
+        if context_after:
+            # Get first paragraph after table
+            context_lines = context_after.split('\n')
+            relevant_context = '\n'.join(context_lines[:3]) if len(context_lines) > 3 else context_after
+            enhanced_table_content += f"\n\n{relevant_context}"
+        
+        chunks.append({
+            "content": enhanced_table_content,
+            "type": "table",
+            "chunk_index": chunk_index,
+            "contains_table": True,
+            "table_caption": table_pos["caption"]
+        })
+        chunk_index += 1
+        
+        current_pos = table_pos["end"]
+    
+    # Add remaining text after last table
+    remaining_text = markdown_content[current_pos:].strip()
+    if remaining_text:
+        text_chunks = text_splitter.split_text(remaining_text)
+        for text_chunk in text_chunks:
+            if len(text_chunk.strip()) > 20:
+                chunks.append({
+                    "content": text_chunk,
+                    "type": "text",
+                    "chunk_index": chunk_index,
+                    "contains_table": False
+                })
+                chunk_index += 1
+    
+    return chunks
+
+def improve_chunk_quality(chunks: List[Dict]) -> List[Dict]:
+    """Filter and improve chunk quality"""
+    improved_chunks = []
+    
+    for chunk in chunks:
+        content = chunk["content"].strip()
+        
+        # Skip very short chunks
+        if len(content) < 30:
+            continue
+        
+        # Skip metadata-only chunks
+        if is_metadata_chunk(content):
+            continue
+        
+        # Clean up content
+        content = clean_chunk_content(content)
+        
+        if len(content.strip()) > 30:
+            chunk["content"] = content
+            improved_chunks.append(chunk)
+    
+    return improved_chunks
+
+def is_metadata_chunk(content: str) -> bool:
+    """Identify chunks that are primarily metadata"""
+    content_lower = content.lower()
+    
+    # Header/footer patterns
+    metadata_patterns = [
+        r'página \d+ de \d+',
+        r'boletín oficial del estado',
+        r'núm\. \d+.*miércoles.*\d+ de.*\d+',
+        r'sec\. iii\. pág\. \d+',
+        r'cve: boe-a-\d+-\d+',
+        r'verificable en https://www\.boe\.es'
+    ]
+    
+    for pattern in metadata_patterns:
+        if re.search(pattern, content_lower) and len(content) < 200:
+            return True
+    
+    return False
+
+def clean_chunk_content(content: str) -> str:
+    """Clean and normalize chunk content"""
+    # Remove excessive whitespace
+    content = re.sub(r'\n\s*\n\s*\n', '\n\n', content)
+    
+    # Remove image placeholders
+    content = re.sub(r'<!-- image -->', '', content)
+    content = re.sub(r'!\[image\].*?\n', '', content)
+    
+    # Clean up table formatting
+    content = re.sub(r'\|\s*\|\s*\|', '||', content)
+    
+    return content.strip()
+
+def is_image_file(file_path: str) -> bool:
+    """Check if file is an image based on extension"""
+    image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'}
+    _, ext = os.path.splitext(file_path.lower())
+    return ext in image_extensions
+
+def encode_image_to_base64(image_path: str) -> str:
+    """Encode image file to base64 string"""
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
+
+async def process_image_with_openai(image_path: str) -> str:
+    """Process image using OpenAI Vision API"""
+    try:
+        # Get image extension to determine MIME type
+        _, ext = os.path.splitext(image_path.lower())
+        mime_type = "image/jpeg" if ext in ['.jpg', '.jpeg'] else f"image/{ext[1:]}"
+        
+        # Encode image
+        base64_image = encode_image_to_base64(image_path)
+        
+        # Create the vision request
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",  # Use gpt-4o for vision
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """Analyze this image and extract all text content, data, and meaningful information. 
+                            Structure your response as follows:
+                            
+                            ## Image Description
+                            [Describe what you see in the image]
+                            
+                            ## Extracted Text
+                            [All text found in the image, maintaining original formatting where possible]
+                            
+                            ## Data and Information
+                            [Any structured data, tables, charts, diagrams, or other meaningful information]
+                            
+                            ## Context and Analysis
+                            [Any additional context or analysis that would be helpful for document search and retrieval]
+                            
+                            Please be thorough and accurate in your extraction."""
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{base64_image}",
+                                "detail": "high"  # High detail for better text extraction
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=4000,
+            temperature=0.1  # Low temperature for consistent extraction
+        )
+        
+        content = response.choices[0].message.content
+        logger.info(f"OpenAI Vision processing successful, extracted {len(content)} characters")
+        return content
+        
+    except Exception as e:
+        logger.error(f"OpenAI Vision processing failed: {e}")
+        raise Exception(f"Image processing failed: {str(e)}")
+
+async def notify_nextjs(document_id: str, success: bool, error_message: Optional[str] = None, max_retries: int = 3):
+    """Sends completion status back to the Next.js API route with retry logic."""
     if not NEXTJS_CALLBACK_URL or not PYTHON_SERVICE_SECRET:
         logger.error("Callback URL or Secret not configured. Cannot notify Next.js.")
         return
@@ -99,38 +374,46 @@ async def notify_nextjs(document_id: str, success: bool, error_message: Optional
     }
     headers = {
         "Content-Type": "application/json",
-        "X-Processing-Secret": PYTHON_SERVICE_SECRET # Authentication header
+        "X-Processing-Secret": PYTHON_SERVICE_SECRET
     }
+    
     logger.info(f"Attempting to notify Next.js at {NEXTJS_CALLBACK_URL} for doc {document_id}, success={success}")
 
-    async with httpx.AsyncClient(timeout=30.0) as client: # Add a timeout
+    for attempt in range(max_retries):
         try:
-            response = await client.post(NEXTJS_CALLBACK_URL, json=payload, headers=headers)
-            response.raise_for_status() # Check for 4xx/5xx errors
-            logger.info(f"Successfully notified Next.js for document {document_id}. Status: {success}. Response: {response.status_code}")
-        except httpx.RequestError as e:
-            logger.error(f"HTTP Request error notifying Next.js for document {document_id}: {e}")
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(NEXTJS_CALLBACK_URL, json=payload, headers=headers)
+                response.raise_for_status()
+                logger.info(f"Successfully notified Next.js for document {document_id}. Status: {success}.")
+                return  # Success, exit retry loop
+                
+        except httpx.TimeoutException as e:
+            logger.warning(f"Timeout error notifying Next.js for document {document_id} (attempt {attempt + 1}/{max_retries}): {e}")
+        except httpx.ConnectError as e:
+            logger.warning(f"Connection error notifying Next.js for document {document_id} (attempt {attempt + 1}/{max_retries}): {e}")
         except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP Status error notifying Next.js for document {document_id}: {e.response.status_code} - {e.response.text}")
+            logger.warning(f"HTTP {e.response.status_code} error notifying Next.js for document {document_id} (attempt {attempt + 1}/{max_retries}): {e}")
         except Exception as e:
-            logger.error(f"Unexpected error notifying Next.js for document {document_id}: {e}")
-            logger.error(traceback.format_exc())
+            logger.warning(f"Unexpected error notifying Next.js for document {document_id} (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
+        
+        # Wait before retry (exponential backoff)
+        if attempt < max_retries - 1:
+            wait_time = 2 ** attempt  # 1s, 2s, 4s
+            logger.info(f"Retrying notification for document {document_id} in {wait_time} seconds...")
+            await asyncio.sleep(wait_time)
+    
+    # All retries failed
+    logger.error(f"Failed to notify Next.js for document {document_id} after {max_retries} attempts")
 
-
-# --- API Endpoints ---
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
 
 @app.post("/process")
 async def process_document(payload: ProcessRequest):
-    """
-    Download doc from S3, process into chunks/embeddings,
-    upload results to S3, and trigger indexing via Next.js callback.
-    """
+    """Enhanced document processing with better table handling"""
     s3_key = payload.s3_key
     document_id = payload.document_id
-    # Extract original filename from key if needed, assuming format folder/uuid-filename.ext
     original_filename = s3_key.split('-')[-1] if '-' in s3_key else s3_key.split('/')[-1]
 
     logger.info(f"Received processing request for document_id: {document_id}, s3_key: {s3_key}")
@@ -146,155 +429,190 @@ async def process_document(payload: ProcessRequest):
                 s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_path)
                 logger.info(f"S3 download successful for {document_id}.")
             except ClientError as e:
-                 error_code = e.response.get("Error", {}).get("Code")
-                 error_message = f"S3 Download error: {e}"
-                 if error_code == '404': # Check for Not Found specifically
-                     error_message = f"S3 Key not found: {s3_key}"
-                     logger.error(error_message)
-                     await notify_nextjs(document_id, success=False, error_message=error_message)
-                     raise HTTPException(status_code=404, detail=error_message)
-                 else:
-                     logger.error(error_message)
-                     await notify_nextjs(document_id, success=False, error_message=error_message)
-                     raise HTTPException(status_code=500, detail=error_message)
-
-        # 2. Extract Text & Chunk
-        logger.info(f"Processing downloaded file: {temp_path} for doc: {document_id}")
-        documents: List[Document] = []
-        # Base metadata to add to all chunks
-        base_metadata = {"document_id": document_id, "original_filename": original_filename}
-        # Add folderId if it's part of the s3_key structure (e.g., "folderId/uuid-name.pdf")
-        key_parts = s3_key.split('/')
-        if len(key_parts) > 1 and key_parts[0] != 'root':
-             base_metadata["folder_id"] = key_parts[0]
-        else:
-             base_metadata["folder_id"] = "root" # Explicitly mark root
-
-
-        # --- MINIMAL CHANGE START ---
-        # Introduce a flag to easily switch between strategies later if needed
-        # Set to False to always skip Unstructured and use PyPDF fallback
-        USE_UNSTRUCTURED_LOADER = False
-
-        if USE_UNSTRUCTURED_LOADER:
-            # Try Unstructured (consider making strategy configurable via payload if needed)
-            try:
-                # Change strategy here if you want to re-enable Unstructured later
-                loader = UnstructuredLoader(temp_path, strategy="hi_res") # or "fast"
-                loaded_docs = loader.load() # Unstructured chunks internally
-                if loaded_docs:
-                     # Add base metadata to unstructured chunks
-                     for doc in loaded_docs:
-                         doc.metadata.update(base_metadata)
-                     documents = loaded_docs
-                     logger.info(f"Unstructured loaded {len(documents)} chunks for doc: {document_id}.")
+                error_code = e.response.get("Error", {}).get("Code")
+                error_message = f"S3 Download error: {e}"
+                if error_code == '404':
+                    error_message = f"S3 Key not found: {s3_key}"
+                    logger.error(error_message)
+                    await notify_nextjs(document_id, success=False, error_message=error_message)
+                    raise HTTPException(status_code=404, detail=error_message)
                 else:
-                     logger.info(f"UnstructuredLoader returned no chunks for doc: {document_id}.")
-            except Exception as loader_error:
-                logger.warning(f"UnstructuredLoader failed for doc {document_id}: {loader_error}. Trying PyPDF.")
-                # If Unstructured fails, 'documents' remains empty, forcing the fallback below.
-        # --- MINIMAL CHANGE END ---
+                    logger.error(error_message)
+                    await notify_nextjs(document_id, success=False, error_message=error_message)
+                    raise HTTPException(status_code=500, detail=error_message)
 
+        # Extract folder_id from s3_key structure
+        key_parts = s3_key.split('/')
+        folder_id = key_parts[0] if len(key_parts) > 1 and key_parts[0] != 'root' else "root"
 
-        # Fallback to PyPDF (This will now always run if USE_UNSTRUCTURED_LOADER is False)
-        # If USE_UNSTRUCTURED_LOADER was False, 'documents' is still [], so this block executes.
-        # If USE_UNSTRUCTURED_LOADER was True but failed or returned no chunks, this block also executes.
-        if not documents:
-            extracted_text_pypdf = extract_text_with_pypdf(temp_path)
-            if extracted_text_pypdf:
-                logger.info(f"PyPDF extracted text for doc {document_id}. Splitting...")
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1000,
-                    chunk_overlap=150,
-                    separators=["\n\n", "\n", ". ", "? ", "! ", " ", ""],
-                    length_function=len,
+        # 2. Check if it's an image file and process accordingly
+        if is_image_file(temp_path):
+            logger.info(f"Processing IMAGE file with OpenAI Vision: {temp_path} for doc: {document_id}")
+            
+            try:
+                # Process image with OpenAI Vision
+                extracted_content = await process_image_with_openai(temp_path)
+                logger.info(f"Image processing successful, extracted {len(extracted_content)} characters")
+
+                # Create chunks from the extracted content
+                chunks_data = []
+                if extracted_content and len(extracted_content.strip()) > 30:
+                    # Split the content into manageable chunks
+                    content_chunks = text_splitter.split_text(extracted_content)
+                    
+                    for i, chunk_content in enumerate(content_chunks):
+                        if len(chunk_content.strip()) > 30:
+                            chunks_data.append({
+                                "content": chunk_content,
+                                "type": "image_extracted",
+                                "chunk_index": i,
+                                "contains_table": False  # Could be enhanced to detect tables in vision output
+                            })
+
+                logger.info(f"Created {len(chunks_data)} chunks from image content")
+
+            except Exception as vision_error:
+                logger.error(f"Image processing failed for doc {document_id}: {vision_error}")
+                await notify_nextjs(document_id, success=False, 
+                                  error_message=f"Image processing failed: {vision_error}")
+                raise HTTPException(status_code=500, detail=f"Image processing failed: {vision_error}")
+        
+        else:
+            # 3. ENHANCED Docling Processing for non-image files
+            logger.info(f"Processing DOCUMENT file with ENHANCED Docling: {temp_path} for doc: {document_id}")
+            
+            try:
+                # Convert document with Docling
+                logger.info("Converting document with Docling...")
+                result = converter.convert(temp_path)
+                logger.info("Document conversion successful.")
+
+                # Extract tables BEFORE converting to markdown
+                logger.info("Extracting tables from Docling document...")
+                tables = extract_tables_from_docling(result.document)
+                logger.info(f"Extracted {len(tables)} tables from document")
+
+                # Export to markdown
+                logger.info("Exporting document to markdown...")
+                markdown = result.document.export_to_markdown()
+                logger.info(f"Markdown export successful, length: {len(markdown)} characters")
+
+                # Create smart chunks that preserve table structure
+                logger.info("Creating smart chunks with table preservation...")
+                chunks_data = create_smart_chunks(markdown, tables)
+                logger.info(f"Created {len(chunks_data)} initial chunks")
+
+                # Improve chunk quality
+                logger.info("Improving chunk quality...")
+                chunks_data = improve_chunk_quality(chunks_data)
+                logger.info(f"Final chunk count after quality improvement: {len(chunks_data)}")
+
+            except Exception as docling_error:
+                logger.error(f"Docling processing failed for doc {document_id}: {docling_error}")
+                logger.error(traceback.format_exc())
+                await notify_nextjs(document_id, success=False, 
+                                  error_message=f"Document processing failed: {docling_error}")
+                raise HTTPException(status_code=500, detail=f"Document processing failed: {docling_error}")
+
+        # Check if we have any chunks (common for both image and document processing)
+        if not chunks_data:
+            logger.warning(f"No chunks generated for doc: {document_id}.")
+            await notify_nextjs(document_id, success=True, 
+                              error_message="Document processed but contained no text chunks.")
+            return {"message": f"Document {document_id} processed, no text chunks found."}
+
+        # Log processing statistics
+        file_type = "image" if is_image_file(temp_path) else "document"
+        table_chunks = [c for c in chunks_data if c.get("contains_table", False)]
+        text_chunks = [c for c in chunks_data if not c.get("contains_table", False)]
+        
+        logger.info(f"Processing statistics for {file_type}:")
+        logger.info(f"  - Total chunks: {len(chunks_data)}")
+        logger.info(f"  - Table chunks: {len(table_chunks)}")
+        logger.info(f"  - Text chunks: {len(text_chunks)}")
+        
+        if table_chunks and file_type == "document":
+            logger.info(f"  - Table chunks content preview:")
+            for i, chunk in enumerate(table_chunks[:2]):  # Show first 2 table chunks
+                logger.info(f"    Table {i+1}: {chunk['content'][:200]}...")
+
+        # 3. Prepare records for Pinecone
+        records = []
+        for chunk_data in chunks_data:
+            record_id = f"{document_id}_chunk_{chunk_data['chunk_index']}"
+            
+            # Prepare metadata for the chunk
+            metadata = {
+                "documentId": document_id,
+                "folderId": folder_id,
+                "originalFilename": original_filename,
+                "chunkIndex": chunk_data['chunk_index'],
+                "chunkLength": len(chunk_data['content']),
+                "chunkType": chunk_data['type'],
+                "containsTable": chunk_data.get('contains_table', False)
+            }
+            
+            # Add table-specific metadata
+            if chunk_data.get('contains_table'):
+                metadata["tableCaption"] = chunk_data.get('table_caption', '')
+            
+            # Add image-specific metadata
+            if chunk_data['type'] == 'image_extracted':
+                metadata["isImageDerived"] = True
+                metadata["imageS3Key"] = s3_key
+                metadata["imageS3Bucket"] = S3_BUCKET_NAME
+
+            # Create record for Pinecone
+            record = {
+                "_id": record_id,
+                "text": chunk_data['content'],
+                **metadata
+            }
+            records.append(record)
+
+        # 4. Upsert records to Pinecone
+        batch_size = 96
+        logger.info(f"Upserting {len(records)} records to Pinecone namespace '{PINECONE_NAMESPACE}' for doc {document_id}...")
+        
+        try:
+            for i in range(0, len(records), batch_size):
+                batch = records[i:i + batch_size]
+                pinecone_index.upsert_records(
+                    namespace=PINECONE_NAMESPACE,
+                    records=batch
                 )
-                # Create a single Document object with base metadata for splitting
-                full_doc_obj = Document(page_content=extracted_text_pypdf, metadata=base_metadata)
-                documents = text_splitter.split_documents([full_doc_obj])
-                logger.info(f"Split into {len(documents)} chunks using text splitter for doc: {document_id}.")
-            else:
-                logger.warning(f"PyPDF fallback also failed for doc {document_id}. No text extracted.")
-                await notify_nextjs(document_id, success=False, error_message="Failed to extract text from document.")
-                # Decide: Raise error or allow "empty" success? Let's raise for clarity.
-                raise HTTPException(status_code=400, detail="Failed to extract text from document.")
+                logger.info(f"Upserted batch {i//batch_size + 1}/{(len(records) + batch_size - 1)//batch_size} for doc {document_id}")
+            
+            logger.info(f"Successfully upserted all records for document {document_id}")
 
-        # 3. Prepare for Embedding & S3 Upload of Results
-        chunks_for_json = []
-        texts_to_embed = []
-
-        if not documents:
-             logger.warning(f"No document chunks generated for doc: {document_id}.")
-             await notify_nextjs(document_id, success=True, error_message="Document processed but contained no text chunks.")
-             return {"message": f"Document {document_id} processed, no text chunks found."}
-
-        for i, doc in enumerate(documents):
-            chunk_text = doc.page_content
-            # Metadata already contains document_id, folder_id, filename from base_metadata
-            chunk_metadata = doc.metadata
-            chunk_metadata["chunk_index"] = i # Add chunk index
-
-            # Pinecone ID: Ensure it's unique and valid ASCII
-            # Consider sanitizing if document_id or i could be problematic, though cuid + index should be safe
-            chunk_id = f"{document_id}_chunk_{i}"
-
-            chunks_for_json.append({
-                "id": chunk_id,              # ID for the Pinecone vector
-                "text": chunk_text,          # Text content of the chunk
-                "metadata": chunk_metadata,  # Metadata for Pinecone vector
-            })
-            texts_to_embed.append(chunk_text)
-
-        # 4. Generate Embeddings
-        logger.info(f"Generating embeddings for {len(texts_to_embed)} chunks for doc: {document_id}...")
-        try:
-            embeddings_list = embeddings.embed_documents(texts_to_embed)
-            logger.info(f"Embedding generation complete for doc: {document_id}.")
-        except Exception as embed_error:
-            logger.error(f"Embedding generation failed for doc {document_id}: {embed_error}")
-            await notify_nextjs(document_id, success=False, error_message=f"Embedding generation failed: {embed_error}")
-            raise HTTPException(status_code=500, detail=f"Embedding generation failed: {embed_error}")
-
-        # 5. Upload Processed Data (JSON with chunks/embeddings) back to S3
-        processed_data = {
-            "document_id": document_id,
-            "chunks_with_metadata": chunks_for_json, # Contains ID, text, metadata
-            "embeddings": embeddings_list            # List of vectors
-        }
-        processed_data_key = f"processed/{document_id}.json"
-        logger.info(f"Uploading processed data for doc {document_id} to s3://{S3_BUCKET_NAME}/{processed_data_key}")
-        try:
-            s3_client.put_object(
-                Bucket=S3_BUCKET_NAME,
-                Key=processed_data_key,
-                Body=json.dumps(processed_data), # Serialize dict to JSON string
-                ContentType='application/json'
-            )
-            logger.info(f"Successfully uploaded processed data for doc {document_id}")
-
-            # 6. Notify Next.js of SUCCESS (Now Next.js knows where to get data)
+            # 5. Notify Next.js of success
             await notify_nextjs(document_id, success=True)
 
-            return {"message": f"Processing complete for {document_id}. Processed data at {processed_data_key}"}
+            return {
+                "message": f"Processing complete for {document_id}",
+                "file_type": file_type,
+                "chunks_created": len(records),
+                "table_chunks": len([r for r in records if r.get("containsTable", False)]),
+                "text_chunks": len([r for r in records if not r.get("containsTable", False)]),
+                "image_chunks": len([r for r in records if r.get("chunkType") == "image_extracted"])
+            }
 
-        except ClientError as e:
-            error_message = f"Failed to upload processed data to S3 for doc {document_id}: {e}"
-            logger.error(error_message)
-            await notify_nextjs(document_id, success=False, error_message=error_message)
-            raise HTTPException(status_code=500, detail=error_message)
+        except Exception as pinecone_error:
+            logger.error(f"Pinecone upsert failed for doc {document_id}: {pinecone_error}")
+            await notify_nextjs(document_id, success=False, 
+                              error_message=f"Pinecone upsert failed: {pinecone_error}")
+            raise HTTPException(status_code=500, detail=f"Pinecone upsert failed: {pinecone_error}")
 
     except HTTPException as http_exc:
-        # Re-raise HTTP exceptions (like 404, 400) to return correct status codes
         raise http_exc
     except Exception as e:
-        # Catch-all for unexpected errors during the whole process
         error_message = f"Unexpected error processing document {document_id}: {str(e)}"
         logger.error(error_message)
         logger.error(traceback.format_exc())
         await notify_nextjs(document_id, success=False, error_message=error_message)
         raise HTTPException(status_code=500, detail=error_message)
     finally:
-        # Clean up downloaded temp file
+        # Clean up temporary file
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
@@ -302,10 +620,7 @@ async def process_document(payload: ProcessRequest):
             except Exception as cleanup_error:
                  logger.error(f"Error removing temp file {temp_path} for doc {document_id}: {cleanup_error}")
 
-# --- Run the App ---
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000)) # Default to 8000 if PORT not set
+    port = int(os.getenv("PORT", 8000))
     logger.info(f"Starting Uvicorn server on 0.0.0.0:{port}")
-    # Use reload=True only for local development
-    # uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False) # For deployment
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
