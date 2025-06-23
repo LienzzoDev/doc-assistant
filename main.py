@@ -6,6 +6,7 @@ import os
 import traceback
 import logging
 import asyncio
+import signal
 from dotenv import load_dotenv
 from typing import Optional, Dict, Any, List
 import json
@@ -30,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 # --- Load Environment Variables ---
 load_dotenv()
+
+# --- Timeout Handler ---
+def timeout_handler(signum, frame):
+    raise TimeoutError("Docling processing timed out")
 
 # --- Initialize Clients ---
 app = FastAPI(title="Document Processor")
@@ -482,9 +487,13 @@ async def process_document(payload: ProcessRequest):
             logger.info(f"Processing DOCUMENT file with ENHANCED Docling: {temp_path} for doc: {document_id}")
             
             try:
-                # Convert document with Docling
+                # Convert document with Docling with timeout protection
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(2400)  # 40 minute timeout
+                
                 logger.info("Converting document with Docling...")
                 result = converter.convert(temp_path)
+                signal.alarm(0)  # Cancel timeout
                 logger.info("Document conversion successful.")
 
                 # Extract tables BEFORE converting to markdown
@@ -507,6 +516,12 @@ async def process_document(payload: ProcessRequest):
                 chunks_data = improve_chunk_quality(chunks_data)
                 logger.info(f"Final chunk count after quality improvement: {len(chunks_data)}")
 
+            except TimeoutError:
+                signal.alarm(0)  # Cancel any pending alarm
+                logger.error(f"Docling conversion timed out after 20 minutes for doc {document_id}")
+                await notify_nextjs(document_id, success=False, 
+                                  error_message="Document processing timed out after 20 minutes")
+                raise HTTPException(status_code=500, detail="Document processing timed out after 20 minutes")
             except Exception as docling_error:
                 logger.error(f"Docling processing failed for doc {document_id}: {docling_error}")
                 logger.error(traceback.format_exc())
@@ -586,7 +601,9 @@ async def process_document(payload: ProcessRequest):
             logger.info(f"Successfully upserted all records for document {document_id}")
 
             # 5. Notify Next.js of success
+            logger.info(f"About to notify Next.js of SUCCESS for individual document: {document_id}")
             await notify_nextjs(document_id, success=True)
+            logger.info(f"Finished notifying Next.js of SUCCESS for individual document: {document_id}")
 
             return {
                 "message": f"Processing complete for {document_id}",
