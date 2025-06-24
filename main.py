@@ -101,7 +101,7 @@ try:
     required_vars = [
         "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", 
         "PINECONE_API_KEY", "PINECONE_INDEX_NAME",
-        S3_BUCKET_NAME, NEXTJS_CALLBACK_URL, PYTHON_SERVICE_SECRET
+        "AWS_S3_BUCKET_NAME", "NEXTJS_CALLBACK_URL", "PYTHON_SERVICE_SECRET"
     ]
     if not all(os.getenv(var) for var in required_vars):
         logger.critical("CRITICAL: Missing one or more required environment variables!")
@@ -315,7 +315,7 @@ async def process_image_with_openai(image_path: str) -> str:
         
         # Create the vision request
         response = openai_client.chat.completions.create(
-            model="gpt-4o",  # Use gpt-4o for vision
+            model="chatgpt-4o-latest",  # Use gpt-4o for vision
             messages=[
                 {
                     "role": "user",
