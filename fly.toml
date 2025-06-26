@@ -3,20 +3,25 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'document-processor-little-hill-971'
-primary_region = 'mad'
+app = "doc-assistant"
+primary_region = "fra"
 
-[build]
+# This tells Fly to use the image you build locally,
+# rather than building it remotely.
+image = "doc-assistant-optimized"
 
 [http_service]
-  internal_port = 8000
-  force_https = true
-  auto_stop_machines = 'stop'
-  auto_start_machines = true
-  min_machines_running = 0
-  processes = ['app']
+auto_start_machines = true
+auto_stop_machines = "suspend" 
+force_https = true
+internal_port = 8000
+min_machines_running = 0
+processes = [ "app" ]
+
+[http_service.concurrency]
+type = "requests"
+soft_limit = 1  
+hard_limit = 1
 
 [[vm]]
-  memory = '1gb'
-  cpu_kind = 'shared'
-  cpus = 1
+size = "performance-8x"

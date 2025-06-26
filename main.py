@@ -22,11 +22,49 @@ from pinecone import Pinecone
 import re
 from openai import OpenAI
 import base64
+from pathlib import Path
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# --- CRITICAL: Set up HuggingFace cache paths BEFORE any imports ---
+# This ensures docling uses the pre-cached models
+os.environ['HF_HOME'] = '/app/.cache/huggingface'
+os.environ['HF_HUB_CACHE'] = '/app/.cache/huggingface/hub'
+os.environ['TRANSFORMERS_CACHE'] = '/app/.cache/huggingface/transformers'
+os.environ['HF_DATASETS_CACHE'] = '/app/.cache/huggingface/datasets'
+
+# Force offline mode to use cached models only
+os.environ['HF_HUB_OFFLINE'] = '1'
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+
+# Log cache status at startup
+def verify_model_cache():
+    """Verify that models are cached and accessible"""
+    cache_path = Path('/app/.cache/huggingface/hub')
+    
+    if cache_path.exists():
+        file_count = len([f for f in cache_path.rglob('*') if f.is_file()])
+        logger.info(f"Model cache found at {cache_path} with {file_count} files")
+        
+        # Look for docling models specifically
+        docling_models = list(cache_path.glob('**/models--ds4sd--docling-models*'))
+        if docling_models:
+            logger.info(f"Found docling models: {[str(p) for p in docling_models]}")
+            return True
+        else:
+            logger.warning("Docling models not found in cache!")
+            return False
+    else:
+        logger.error(f"Model cache directory does not exist: {cache_path}")
+        return False
+
+# Verify cache on startup
+cache_available = verify_model_cache()
+if not cache_available:
+    logger.critical("CRITICAL: Model cache not available - this will cause runtime failures!")
 
 # --- Load Environment Variables ---
 load_dotenv()
@@ -55,45 +93,55 @@ try:
     PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "__default__")
 
     # Initialize Docling converter with OPTIMIZED table parsing options
+    logger.info("Initializing Docling converter...")
+    
     pipeline_options = PdfPipelineOptions()
     
     # CRITICAL: Enable table structure detection
     pipeline_options.do_table_structure = True
     
     # Table structure options - IMPROVED SETTINGS
-    pipeline_options.table_structure_options.do_cell_matching = True  # Enable this for better table parsing
-    pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE  # Best quality
+    pipeline_options.table_structure_options.do_cell_matching = True
+    pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE
     
     # OCR options for better text extraction
     pipeline_options.do_ocr = False
-    pipeline_options.ocr_options.force_full_page_ocr = False  # Only OCR when needed
+    pipeline_options.ocr_options.force_full_page_ocr = False
     
-    converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-        }
-    )
+    try:
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            }
+        )
+        logger.info("Docling converter initialized successfully")
+    except Exception as conv_error:
+        logger.error(f"Failed to initialize Docling converter: {conv_error}")
+        logger.error(f"Cache status: {cache_available}")
+        if not cache_available:
+            logger.error("This error is likely due to missing model cache")
+        raise
 
     # IMPROVED text splitter with table-aware separators
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=2000,        # Larger chunks for complete tables
-        chunk_overlap=400,      # More overlap for context
+        chunk_size=2000,
+        chunk_overlap=400,
         separators=[
-            "\n\n\n\n",        # Multiple line breaks (section separators)
-            "\n\n\n",          # Between sections
-            "\n\n",            # Paragraph breaks
-            "\n## ",           # Headers
+            "\n\n\n\n",
+            "\n\n\n",
+            "\n\n",
+            "\n## ",
             "\n### ",
             "\n#### ",
-            "\n|",             # Table row endings
-            "|\n",             # Another table pattern
-            "\n- ",            # List items
+            "\n|",
+            "|\n",
+            "\n- ",
             "\n* ",
             ". ",
             ".\n",
             " ",
         ],
-        keep_separator=True,    # Keep separators for better context
+        keep_separator=True,
         length_function=len,
     )
 
@@ -108,6 +156,7 @@ try:
 
 except Exception as e:
     logger.critical(f"CRITICAL: Failed to initialize clients: {e}")
+    logger.critical(traceback.format_exc())
 
 # --- CORS ---
 app.add_middleware(
@@ -172,7 +221,7 @@ def create_smart_chunks(markdown_content: str, tables: List[Dict]) -> List[Dict]
         if text_before:
             text_chunks = text_splitter.split_text(text_before)
             for text_chunk in text_chunks:
-                if len(text_chunk.strip()) > 20:  # Minimum viable chunk
+                if len(text_chunk.strip()) > 20:
                     chunks.append({
                         "content": text_chunk,
                         "type": "text",
@@ -194,7 +243,6 @@ def create_smart_chunks(markdown_content: str, tables: List[Dict]) -> List[Dict]
         # Create enhanced table chunk
         enhanced_table_content = ""
         if context_before:
-            # Get last paragraph before table
             context_lines = context_before.split('\n')
             relevant_context = '\n'.join(context_lines[-3:]) if len(context_lines) > 3 else context_before
             enhanced_table_content += f"{relevant_context}\n\n"
@@ -202,7 +250,6 @@ def create_smart_chunks(markdown_content: str, tables: List[Dict]) -> List[Dict]
         enhanced_table_content += table_chunk_content
         
         if context_after:
-            # Get first paragraph after table
             context_lines = context_after.split('\n')
             relevant_context = '\n'.join(context_lines[:3]) if len(context_lines) > 3 else context_after
             enhanced_table_content += f"\n\n{relevant_context}"
@@ -315,7 +362,7 @@ async def process_image_with_openai(image_path: str) -> str:
         
         # Create the vision request
         response = openai_client.chat.completions.create(
-            model="chatgpt-4o-latest",  # Use gpt-4o for vision
+            model="chatgpt-4o-latest",
             messages=[
                 {
                     "role": "user",
@@ -343,14 +390,14 @@ async def process_image_with_openai(image_path: str) -> str:
                             "type": "image_url",
                             "image_url": {
                                 "url": f"data:{mime_type};base64,{base64_image}",
-                                "detail": "high"  # High detail for better text extraction
+                                "detail": "high"
                             }
                         }
                     ]
                 }
             ],
             max_tokens=4000,
-            temperature=0.1  # Low temperature for consistent extraction
+            temperature=0.1
         )
         
         content = response.choices[0].message.content
@@ -385,7 +432,7 @@ async def notify_nextjs(document_id: str, success: bool, error_message: Optional
                 response = await client.post(NEXTJS_CALLBACK_URL, json=payload, headers=headers)
                 response.raise_for_status()
                 logger.info(f"Successfully notified Next.js for document {document_id}. Status: {success}.")
-                return  # Success, exit retry loop
+                return
                 
         except httpx.TimeoutException as e:
             logger.warning(f"Timeout error notifying Next.js for document {document_id} (attempt {attempt + 1}/{max_retries}): {e}")
@@ -398,16 +445,21 @@ async def notify_nextjs(document_id: str, success: bool, error_message: Optional
         
         # Wait before retry (exponential backoff)
         if attempt < max_retries - 1:
-            wait_time = 2 ** attempt  # 1s, 2s, 4s
+            wait_time = 2 ** attempt
             logger.info(f"Retrying notification for document {document_id} in {wait_time} seconds...")
             await asyncio.sleep(wait_time)
     
-    # All retries failed
     logger.error(f"Failed to notify Next.js for document {document_id} after {max_retries} attempts")
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    cache_status = verify_model_cache()
+    return {
+        "status": "healthy", 
+        "models_cached": cache_status,
+        "hf_offline": os.environ.get('HF_HUB_OFFLINE', 'not_set'),
+        "cache_path": "/app/.cache/huggingface"
+    }
 
 @app.post("/process")
 async def process_document(payload: ProcessRequest):
@@ -466,7 +518,7 @@ async def process_document(payload: ProcessRequest):
                                 "content": chunk_content,
                                 "type": "image_extracted",
                                 "chunk_index": i,
-                                "contains_table": False  # Could be enhanced to detect tables in vision output
+                                "contains_table": False
                             })
 
                 logger.info(f"Created {len(chunks_data)} chunks from image content")
@@ -533,7 +585,7 @@ async def process_document(payload: ProcessRequest):
         
         if table_chunks and file_type == "document":
             logger.info(f"  - Table chunks content preview:")
-            for i, chunk in enumerate(table_chunks[:2]):  # Show first 2 table chunks
+            for i, chunk in enumerate(table_chunks[:2]):
                 logger.info(f"    Table {i+1}: {chunk['content'][:200]}...")
 
         # 3. Prepare records for Pinecone
